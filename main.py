@@ -64,9 +64,14 @@ SSE_DELTA_CHARS = 13
 FAILURES_HEADER = "x-makefun-upstream-failures"
 MAX_FAILURES_REPORTED = 8
 MAX_ATTEMPTS_PER_PROMPT = 6
+# A model is dropped for the rest of the trial only after this many
+# refusals in the trial. One refusal drops it for the current prompt
+# only, so a transient slow/429/no-token call costs one prompt, not
+# every prompt the model would have served best.
+MAX_REFUSALS_PER_MODEL = 2
 # Per-prompt wall budget: the trial client caps each request at 30 s.
 PROMPT_DEADLINE_S = 28.0
-FIRST_ATTEMPT_TIMEOUT_S = 20.0
+FIRST_ATTEMPT_TIMEOUT_S = 16.0
 MIN_ATTEMPT_TIMEOUT_S = 5.0
 DEFAULT_MAX_TOKENS = 512
 
@@ -1095,23 +1100,35 @@ class Router:
     def __init__(self, brief: Json) -> None:
         self._brief = brief
         self._lock = threading.Lock()
-        self._refused: set[str] = set()
+        self._failures: dict[str, int] = {}
+        self._attempted: set[str] = set()
+
+    def begin_prompt(self) -> None:
+        """Start a prompt: models refused on an earlier prompt are back in
+        the pool unless they have refused MAX_REFUSALS_PER_MODEL times in
+        this trial. The env sends one prompt at a time, so no prompt is
+        in flight while another begins."""
+        with self._lock:
+            self._attempted = set()
 
     def candidates(self, requires: Json) -> list[Json]:
         """Free models meeting `requires`, best rating first, id as tie-break."""
         with self._lock:
-            refused = set(self._refused)
+            dropped = {m for m, n in self._failures.items() if n >= MAX_REFUSALS_PER_MODEL}
+            attempted = set(self._attempted)
         pool = [
             m
             for m in free_models(self._brief)
-            if m["id"] not in refused and meets_requirements(requires, capabilities_of(m))
+            if m["id"] not in dropped and m["id"] not in attempted
+            and meets_requirements(requires, capabilities_of(m))
         ]
         pool.sort(key=lambda m: (-m["rating_milli"], m["id"]))
         return pool
 
     def note_refusal(self, model_id: str) -> None:
         with self._lock:
-            self._refused.add(model_id)
+            self._failures[model_id] = self._failures.get(model_id, 0) + 1
+            self._attempted.add(model_id)
 
 
 def _is_timeout(err: BaseException) -> bool:
@@ -1131,6 +1148,7 @@ def serve_prompt(
     one; failures is the refusal trail for the `x-makefun-upstream-failures`
     header (gateway refusals only, in order, at most 8).
     """
+    router.begin_prompt()
     requires = requirements_from_body(client_body)
     tokens = tokens_in(request_text(client_body))
     req_len = len(request_text(client_body))
@@ -1159,9 +1177,16 @@ def serve_prompt(
         except Exception as err:
             if _is_timeout(err):
                 # This model is too slow; the gateway itself may be fine.
-                # Drop the model and fail over -- a timeout is a refusal
-                # of this model, not of the gateway.
+                # Fail over -- a timeout is a refusal of this model, not
+                # of the gateway. The trail records the refusal the gateway
+                # itself records for a client that closed the request:
+                # HTTP 499 client_closed_request. The replay serves that
+                # recorded 499 back, so the live trail and the replay trail
+                # agree and the state export stays byte-identical.
                 router.note_refusal(model["id"])
+                failures.append(
+                    {"status": 499, "code": "client_closed_request", "model": model["id"]}
+                )
                 last_status = 502
                 last_message = f"the model timed out after {timeout:.0f}s"
                 continue
@@ -1184,7 +1209,18 @@ def serve_prompt(
             last_status = 502
             last_message = f"the gateway answered HTTP {upstream.status}"
             continue
-        raw = upstream.text()
+        try:
+            raw = upstream.text()
+        except Exception as err:
+            if _is_timeout(err):
+                router.note_refusal(model["id"])
+                failures.append(
+                    {"status": 499, "code": "client_closed_request", "model": model["id"]}
+                )
+                last_status = 502
+                last_message = f"the model timed out after {timeout:.0f}s"
+                continue
+            raise
         if stream:
             ans = parse_stream_answer(raw)
         else:
