@@ -1,8 +1,8 @@
 # Immense Node — free LIVE model aggregator
 
-make.fun bounty entry: **free-model-aggregator-02** ("The best LIVE free-model
+A free-model aggregator: **free-model-aggregator-02** ("The best LIVE free-model
 aggregator"). One server, two APIs (OpenAI + Anthropic), six real prompts,
-answered by dialling live free models through make.fun's gateway on the
+answered by dialling live free models through the gateway on the
 entrant's pushed OpenRouter key. No simulated provider anywhere.
 
 ## How it wins
@@ -57,4 +57,4 @@ except a 401 (no key), which no entry can survive.
 3. Transcripts bundle (`makefun bundle ...`, from the agent session that
    built the entry).
 4. Sign + submit before **Tue 17 Nov 2026 03:30 UTC (10:30 WIB)** from the
-   make.fun account linked to the wallet in `.makefun/owner.json`.
+   account linked to the wallet in `.makefun/owner.json`.
